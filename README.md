@@ -1,6 +1,6 @@
-# openai-tts-file
+# tts-cloud
 
-Small Python CLI for converting a text file into speech with an OpenAI-compatible TTS API.
+`tts-cloud` is a small Python CLI for converting a text file into speech with an OpenAI-compatible TTS API.
 
 ## Features
 

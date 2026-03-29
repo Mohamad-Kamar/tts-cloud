@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert a text file into an audio file with an OpenAI-compatible TTS API."
+        description="tts-cloud: convert a text file into an audio file with an OpenAI-compatible TTS API."
     )
     parser.add_argument("input_file", help="Path to the input .txt file")
     parser.add_argument(
