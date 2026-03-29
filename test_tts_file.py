@@ -6,29 +6,24 @@ from pathlib import Path
 
 from tts_file import (
     calculate_tts_cost_usd,
-    normalize_model_for_pricing,
+    is_priced_model,
     probe_audio_duration_seconds,
 )
 
 
-class TtsCostTests(unittest.TestCase):
+class TtsHelpersTests(unittest.TestCase):
     def test_gpt_4o_mini_tts_uses_audio_duration_pricing(self) -> None:
-        cost = calculate_tts_cost_usd("hello world", "gpt-4o-mini-tts", 60.0)
+        cost = calculate_tts_cost_usd("gpt-4o-mini-tts", 60.0)
         self.assertAlmostEqual(cost, 0.015, places=6)
 
-    def test_snapshot_alias_normalizes_to_model_family(self) -> None:
-        self.assertEqual(
-            normalize_model_for_pricing("gpt-4o-mini-tts-2025-03-20"),
-            "gpt-4o-mini-tts",
-        )
-        cost = calculate_tts_cost_usd(
-            "hello world", "gpt-4o-mini-tts-2025-03-20", 60.0
-        )
+    def test_snapshot_alias_is_treated_as_priced_model(self) -> None:
+        self.assertTrue(is_priced_model("gpt-4o-mini-tts-2025-03-20"))
+        cost = calculate_tts_cost_usd("gpt-4o-mini-tts-2025-03-20", 60.0)
         self.assertAlmostEqual(cost, 0.015, places=6)
 
-    def test_tts_1_uses_character_pricing(self) -> None:
-        cost = calculate_tts_cost_usd("a" * 1_000_000, "tts-1", None)
-        self.assertAlmostEqual(cost, 15.0, places=6)
+    def test_unknown_model_has_no_cost(self) -> None:
+        self.assertFalse(is_priced_model("some-other-model"))
+        self.assertIsNone(calculate_tts_cost_usd("some-other-model", 60.0))
 
     @unittest.skipUnless(shutil.which("ffprobe"), "ffprobe is required")
     def test_probe_wav_duration(self) -> None:

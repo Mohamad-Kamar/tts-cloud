@@ -4,10 +4,10 @@ import json
 import os
 import shutil
 import ssl
-import sys
-import time
-import threading
 import subprocess
+import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -16,15 +16,14 @@ DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini-tts"
 DEFAULT_VOICE = "alloy"
 DEFAULT_FORMAT = "mp3"
+SUPPORTED_PRICING_MODEL_PREFIX = "gpt-4o-mini-tts"
+GPT_4O_MINI_TTS_PRICE_USD_PER_MINUTE = 0.015
+PCM_SAMPLE_RATE_HZ = 24_000
+PCM_BYTES_PER_SAMPLE = 2
 PROGRESS_BAR_WIDTH = 28
 PROGRESS_MIN_SECONDS = 2.0
 PROGRESS_MAX_SECONDS = 180.0
 PROGRESS_TICK_SECONDS = 0.1
-MODEL_PRICING = {
-    "gpt-4o-mini-tts": {"type": "per_minute", "price_usd_per_minute": 0.015},
-    "tts-1": {"type": "per_character", "price_usd_per_million_chars": 15.00},
-    "tts-1-hd": {"type": "per_character", "price_usd_per_million_chars": 30.00},
-}
 
 try:
     import certifi
@@ -117,16 +116,12 @@ def build_ssl_context() -> ssl.SSLContext | None:
     return ssl.create_default_context(cafile=certifi.where())
 
 
-def estimate_duration_seconds(text: str, model: str, audio_format: str) -> float:
+def estimate_duration_seconds(text: str, audio_format: str) -> float:
     words = len(text.split())
     chars = len(text)
     sentences = max(1, sum(text.count(ch) for ch in ".!?"))
 
     estimate = 1.25 + (words * 0.07) + (chars * 0.0015) + (sentences * 0.08)
-    if model.startswith("tts-1"):
-        estimate *= 0.95
-    elif model.startswith("gpt-4o"):
-        estimate *= 1.0
 
     format_factor = {
         "mp3": 1.0,
@@ -141,20 +136,14 @@ def estimate_duration_seconds(text: str, model: str, audio_format: str) -> float
     return max(PROGRESS_MIN_SECONDS, min(estimate, PROGRESS_MAX_SECONDS))
 
 
-def normalize_model_for_pricing(model: str) -> str:
-    if model.startswith("gpt-4o-mini-tts"):
-        return "gpt-4o-mini-tts"
-    if model.startswith("tts-1-hd"):
-        return "tts-1-hd"
-    if model.startswith("tts-1"):
-        return "tts-1"
-    return model
+def is_priced_model(model: str) -> bool:
+    return model.startswith(SUPPORTED_PRICING_MODEL_PREFIX)
 
 
 def probe_audio_duration_seconds(path: Path, audio_format: str) -> float | None:
     if audio_format == "pcm":
         # OpenAI PCM output is raw 24kHz, 16-bit, mono samples.
-        return path.stat().st_size / (24000.0 * 2.0)
+        return path.stat().st_size / (PCM_SAMPLE_RATE_HZ * PCM_BYTES_PER_SAMPLE)
 
     if shutil.which("ffprobe") is None:
         return None
@@ -189,18 +178,34 @@ def probe_audio_duration_seconds(path: Path, audio_format: str) -> float | None:
 
 
 def calculate_tts_cost_usd(
-    text: str, model: str, audio_duration_seconds: float | None
+    model: str, audio_duration_seconds: float | None
 ) -> float | None:
-    pricing = MODEL_PRICING.get(normalize_model_for_pricing(model))
-    if pricing is None:
+    if not is_priced_model(model) or audio_duration_seconds is None:
         return None
+    return (
+        audio_duration_seconds / 60.0
+    ) * GPT_4O_MINI_TTS_PRICE_USD_PER_MINUTE
 
-    if pricing["type"] == "per_minute":
-        if audio_duration_seconds is None:
-            return None
-        return (audio_duration_seconds / 60.0) * pricing["price_usd_per_minute"]
 
-    return (len(text) / 1_000_000.0) * pricing["price_usd_per_million_chars"]
+def print_result_summary(
+    output_path: Path,
+    elapsed: float,
+    model: str,
+    audio_format: str,
+) -> None:
+    size_kb = output_path.stat().st_size / 1024
+    print(f"Wrote {output_path} ({size_kb:.1f} KiB) in {elapsed:.2f}s")
+
+    audio_duration_seconds = probe_audio_duration_seconds(output_path, audio_format)
+    estimated_cost = calculate_tts_cost_usd(model, audio_duration_seconds)
+    if estimated_cost is None:
+        print(f"TTS cost: unavailable for model {model}")
+        return
+
+    print(
+        f"TTS cost: ${estimated_cost:.4f} "
+        f"(model: {model}, {audio_duration_seconds:.2f}s of audio)"
+    )
 
 
 def render_progress_line(label: str, elapsed: float, estimated_seconds: float) -> str:
@@ -257,7 +262,7 @@ def main() -> int:
         infer_output_path(input_path, args.output, args.format).expanduser().resolve()
     )
     text = read_text(input_path)
-    estimated_seconds = estimate_duration_seconds(text, args.model, args.format)
+    estimated_seconds = estimate_duration_seconds(text, args.format)
     request = build_request(
         args.base_url, args.api_key, args.model, args.voice, args.format, text
     )
@@ -292,23 +297,7 @@ def main() -> int:
             progress_thread.join(timeout=1)
 
     elapsed = time.perf_counter() - started
-    size_kb = output_path.stat().st_size / 1024
-    print(f"Wrote {output_path} ({size_kb:.1f} KiB) in {elapsed:.2f}s")
-    audio_duration_seconds = probe_audio_duration_seconds(output_path, args.format)
-    estimated_cost = calculate_tts_cost_usd(text, args.model, audio_duration_seconds)
-    if estimated_cost is not None:
-        if audio_duration_seconds is not None and normalize_model_for_pricing(
-            args.model
-        ) == "gpt-4o-mini-tts":
-            basis = f"{audio_duration_seconds:.2f}s of audio"
-        else:
-            basis = f"{len(text)} characters"
-        print(
-            f"TTS cost: ${estimated_cost:.4f} "
-            f"(model: {normalize_model_for_pricing(args.model)}, {basis})"
-        )
-    else:
-        print(f"TTS cost: unavailable for model {args.model}")
+    print_result_summary(output_path, elapsed, args.model, args.format)
     return 0
 
 
