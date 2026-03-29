@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import ipaddress
 import os
 import shutil
 import ssl
+import socket
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.error
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -24,6 +28,7 @@ PROGRESS_BAR_WIDTH = 28
 PROGRESS_MIN_SECONDS = 2.0
 PROGRESS_MAX_SECONDS = 180.0
 PROGRESS_TICK_SECONDS = 0.1
+DEFAULT_MAX_AUDIO_BYTES = 50 * 1024 * 1024  # 50 MiB
 
 try:
     import certifi
@@ -62,6 +67,21 @@ def parse_args() -> argparse.Namespace:
         "--api-key",
         default=os.getenv("OPENAI_API_KEY"),
         help="OpenAI API key (default: OPENAI_API_KEY)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the output file if it already exists",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print full server error payloads (may include your input text)",
+    )
+    parser.add_argument(
+        "--allow-internal-base-url",
+        action="store_true",
+        help="Allow base URLs that resolve to private/loopback IPs (SSRF risk)",
     )
     parser.add_argument(
         "--format",
@@ -108,6 +128,104 @@ def build_request(
             "Content-Type": "application/json",
         },
     )
+
+
+def validate_base_url(base_url: str, *, allow_internal: bool) -> str:
+    """
+    Reduce SSRF risk when using OpenAI-compatible endpoints by:
+    - requiring https
+    - rejecting URLs with credentials in the authority
+    - blocking hostnames that resolve to private/loopback/link-local IPs (unless allowed)
+    """
+
+    if not base_url:
+        raise ValueError("Missing base-url")
+    if "\n" in base_url or "\r" in base_url:
+        raise ValueError("Invalid base-url")
+
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme.lower() != "https":
+        raise ValueError("base-url must use https")
+    if not parsed.hostname:
+        raise ValueError("base-url must include a hostname")
+    if parsed.username or parsed.password:
+        raise ValueError("base-url must not include credentials")
+
+    hostname = parsed.hostname.lower()
+    port = parsed.port or 443
+    if hostname in {"localhost"}:
+        if not allow_internal:
+            raise ValueError("base-url resolves to localhost (use --allow-internal-base-url to override)")
+
+    try:
+        addrinfo = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError(f"base-url hostname cannot be resolved: {hostname}") from e
+
+    blocked_addrs: list[str] = []
+    for info in addrinfo:
+        sockaddr = info[-1]
+        ip_str = sockaddr[0]
+        ip_obj = ipaddress.ip_address(ip_str)
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+        ):
+            blocked_addrs.append(ip_str)
+
+    if blocked_addrs and not allow_internal:
+        raise ValueError(
+            "base-url resolves to private/loopback IPs; use --allow-internal-base-url to override "
+            f"(resolved: {sorted(set(blocked_addrs))})"
+        )
+    return base_url
+
+
+def ensure_safe_output_path(output_path: Path, *, force: bool) -> None:
+    output_path_parent = output_path.parent
+    output_path_parent.mkdir(parents=True, exist_ok=True)
+
+    if output_path.exists() and not force:
+        raise FileExistsError(f"Output file already exists: {output_path} (use --force to overwrite)")
+    if output_path.is_dir():
+        raise IsADirectoryError(f"Output path is a directory: {output_path}")
+    if output_path.is_symlink():
+        raise ValueError(f"Refusing to write to symlink output path: {output_path}")
+
+
+def read_limited_text(file_like, *, max_bytes: int) -> str:
+    raw = file_like.read(max_bytes + 1)
+    truncated = len(raw) > max_bytes
+    raw = raw[:max_bytes]
+    text = raw.decode("utf-8", errors="replace")
+    if truncated:
+        return text + "\n[truncated]"
+    return text
+
+
+def stream_audio_to_output(response, output_path: Path, *, max_bytes: int) -> None:
+    fd, tmp_path = tempfile.mkstemp(prefix=output_path.name + ".", dir=str(output_path.parent))
+    try:
+        total = 0
+        with os.fdopen(fd, "wb") as f:
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"Response too large (>{max_bytes} bytes)")
+                f.write(chunk)
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def build_ssl_context() -> ssl.SSLContext | None:
@@ -261,32 +379,88 @@ def main() -> int:
     output_path = (
         infer_output_path(input_path, args.output, args.format).expanduser().resolve()
     )
+    try:
+        ensure_safe_output_path(output_path, force=args.force)
+    except (FileExistsError, IsADirectoryError, ValueError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
     text = read_text(input_path)
     estimated_seconds = estimate_duration_seconds(text, args.format)
+    try:
+        base_url = validate_base_url(args.base_url, allow_internal=args.allow_internal_base_url)
+    except ValueError as e:
+        print(f"Invalid base-url: {e}", file=sys.stderr)
+        return 2
     request = build_request(
-        args.base_url, args.api_key, args.model, args.voice, args.format, text
+        base_url, args.api_key, args.model, args.voice, args.format, text
     )
     ssl_context = build_ssl_context()
     stop_event, progress_thread = start_progress(
         "Converting text to speech", estimated_seconds, sys.stderr.isatty()
     )
 
+    try:
+        max_audio_bytes = int(
+            os.getenv("OPENAI_TTS_MAX_AUDIO_BYTES", str(DEFAULT_MAX_AUDIO_BYTES))
+        )
+    except ValueError:
+        print(
+            "Invalid OPENAI_TTS_MAX_AUDIO_BYTES; must be an integer number of bytes.",
+            file=sys.stderr,
+        )
+        return 2
+    if max_audio_bytes <= 0:
+        print("OPENAI_TTS_MAX_AUDIO_BYTES must be > 0.", file=sys.stderr)
+        return 2
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(
-            request, timeout=120, context=ssl_context
+            request, timeout=120, context=ssl_context  # nosec B310
         ) as response:
-            body = response.read()
             content_type = response.headers.get("Content-Type", "")
             if "application/json" in content_type:
-                print(body.decode("utf-8", errors="replace"), file=sys.stderr)
+                err_text = read_limited_text(response, max_bytes=8192)
+                if args.debug:
+                    print(err_text, file=sys.stderr)
+                else:
+                    print(
+                        "Server returned a JSON error payload. Enable --debug to view full details "
+                        "(this may include your input text).",
+                        file=sys.stderr,
+                    )
                 return 1
-            output_path.write_bytes(body)
+
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    content_length_value = int(content_length)
+                except ValueError:
+                    print(
+                        f"Invalid Content-Length header: {content_length}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if content_length_value > max_audio_bytes:
+                    print(
+                        f"Response too large (Content-Length={content_length_value} bytes)",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+            stream_audio_to_output(response, output_path, max_bytes=max_audio_bytes)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
         print(f"HTTP {exc.code} {exc.reason}", file=sys.stderr)
-        if body:
-            print(body, file=sys.stderr)
+        if args.debug:
+            body_text = read_limited_text(exc, max_bytes=8192)
+            if body_text:
+                print(body_text, file=sys.stderr)
+        else:
+            body_preview = read_limited_text(exc, max_bytes=256).strip()
+            if body_preview:
+                print(
+                    "Server error details suppressed. Enable --debug for full payload.",
+                    file=sys.stderr,
+                )
         return 1
     except urllib.error.URLError as exc:
         print(f"Request failed: {exc.reason}", file=sys.stderr)

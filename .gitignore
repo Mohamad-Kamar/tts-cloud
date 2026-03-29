@@ -4,6 +4,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+input.txt
 *.mp3
 *.wav
 *.aac

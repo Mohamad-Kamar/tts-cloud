@@ -53,11 +53,15 @@ The CLI accepts flags directly and also supports env-based defaults:
 - `OPENAI_TTS_MODEL`
 - `OPENAI_TTS_VOICE`
 - `OPENAI_TTS_FORMAT`
+- `OPENAI_TTS_MAX_AUDIO_BYTES` (default: 50 MiB)
 
 CLI flags override env values:
 
 - `input_file`: required path to a UTF-8 text file
 - `-o, --output`: output audio path; defaults to the input stem plus the chosen format
+- `--force`: overwrite the output file if it already exists
+- `--debug`: print full server error payloads (may include your input text)
+- `--allow-internal-base-url`: allow `--base-url` values that resolve to private/loopback IPs (SSRF risk)
 - `-m, --model`: TTS model to use
   - Default: `gpt-4o-mini-tts`
   - Cost reporting is only available for the `gpt-4o-mini-tts` family
@@ -91,6 +95,8 @@ OpenAI recommends `marin` or `cedar` for the best quality on the newer speech mo
 - If `ffprobe` is available, cost reporting uses the generated file's actual duration.
 - For raw `pcm` output, duration is derived from 24 kHz, 16-bit mono audio.
 - If you point the CLI at a different provider or unsupported model, generation may still work, but cost reporting may show as unavailable.
+- The CLI validates `--base-url` to require `https` and block private/loopback IPs by default.
+- Server error payloads are suppressed by default to avoid leaking request content; use `--debug` to view details.
 
 ## Testing
 
