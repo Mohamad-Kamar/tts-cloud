@@ -39,6 +39,8 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 
 ```bash
 python3 tts_file.py sample.txt
+python3 tts_file.py --text "Hello from the cloud."
+python3 tts_file.py --stdin -o sample.wav
 python3 tts_file.py sample.txt -o sample.wav --format wav
 python3 tts_file.py sample.txt --model gpt-4o-mini-tts --voice alloy
 python3 tts_file.py sample.txt --model gpt-4o-mini-tts-2025-03-20 --voice marin
@@ -57,11 +59,15 @@ The CLI accepts flags directly and also supports env-based defaults:
 
 CLI flags override env values:
 
-- `input_file`: required path to a UTF-8 text file
+- `input_file`: optional path to a UTF-8 text file
+- `--text`: inline text instead of a file
+- `--stdin`: read text from standard input
 - `-o, --output`: output audio path; defaults to the input stem plus the chosen format
 - `--force`: overwrite the output file if it already exists
 - `--debug`: print full server error payloads (may include your input text)
 - `--allow-internal-base-url`: allow `--base-url` values that resolve to private/loopback IPs (SSRF risk)
+- `--list-voices`: print the documented OpenAI speech voices and exit
+- `--show-settings`: print the resolved runtime settings
 - `-m, --model`: TTS model to use
   - Default: `gpt-4o-mini-tts`
   - Cost reporting is only available for the `gpt-4o-mini-tts` family

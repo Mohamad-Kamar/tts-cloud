@@ -20,6 +20,21 @@ DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini-tts"
 DEFAULT_VOICE = "alloy"
 DEFAULT_FORMAT = "mp3"
+OPENAI_TTS_VOICES = [
+    "alloy",
+    "ash",
+    "ballad",
+    "cedar",
+    "coral",
+    "echo",
+    "fable",
+    "marin",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+    "verse",
+]
 SUPPORTED_PRICING_MODEL_PREFIX = "gpt-4o-mini-tts"
 GPT_4O_MINI_TTS_PRICE_USD_PER_MINUTE = 0.015
 PCM_SAMPLE_RATE_HZ = 24_000
@@ -40,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="tts-cloud: convert a text file into an audio file with an OpenAI-compatible TTS API."
     )
-    parser.add_argument("input_file", help="Path to the input .txt file")
+    parser.add_argument("input_file", nargs="?", help="Path to the input .txt file")
     parser.add_argument(
         "-o",
         "--output",
@@ -84,6 +99,25 @@ def parse_args() -> argparse.Namespace:
         help="Allow base URLs that resolve to private/loopback IPs (SSRF risk)",
     )
     parser.add_argument(
+        "--text",
+        help="Inline text instead of reading from a file",
+    )
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read text from standard input",
+    )
+    parser.add_argument(
+        "--list-voices",
+        action="store_true",
+        help="List documented OpenAI speech voices and exit",
+    )
+    parser.add_argument(
+        "--show-settings",
+        action="store_true",
+        help="Print the resolved runtime settings before synthesis",
+    )
+    parser.add_argument(
         "--format",
         default=os.getenv("OPENAI_TTS_FORMAT", DEFAULT_FORMAT),
         choices=["mp3", "wav", "aac", "flac", "opus", "pcm"],
@@ -99,6 +133,78 @@ def read_text(path: Path) -> str:
     if not text:
         raise ValueError(f"Input file is empty: {path}")
     return text
+
+
+def read_stdin_text() -> str:
+    text = sys.stdin.read().strip()
+    if not text:
+        raise ValueError("Standard input is empty")
+    return text
+
+
+def resolve_input_text(input_file: str | None, inline_text: str | None, use_stdin: bool) -> str:
+    sources = sum(bool(source) for source in (input_file, inline_text, use_stdin))
+    if sources == 0:
+        raise ValueError("Provide a file path, --text, or --stdin")
+    if sources > 1:
+        raise ValueError("Use only one of input_file, --text, or --stdin")
+
+    if inline_text is not None:
+        text = inline_text.strip()
+        if not text:
+            raise ValueError("Inline text is empty")
+        return text
+
+    if use_stdin:
+        return read_stdin_text()
+
+    assert input_file is not None
+    return read_text(Path(input_file))
+
+
+def print_resolved_settings(
+    *,
+    input_source: str,
+    output_path: Path,
+    base_url: str,
+    model: str,
+    voice: str,
+    audio_format: str,
+    force: bool,
+    debug: bool,
+    allow_internal_base_url: bool,
+    max_audio_bytes: int,
+) -> None:
+    print("Resolved settings:", file=sys.stderr)
+    print(f"  input: {input_source}", file=sys.stderr)
+    print(f"  output: {output_path}", file=sys.stderr)
+    print(f"  base-url: {base_url}", file=sys.stderr)
+    print(f"  model: {model}", file=sys.stderr)
+    print(f"  voice: {voice}", file=sys.stderr)
+    print(f"  format: {audio_format}", file=sys.stderr)
+    print(f"  force: {force}", file=sys.stderr)
+    print(f"  debug: {debug}", file=sys.stderr)
+    print(f"  allow-internal-base-url: {allow_internal_base_url}", file=sys.stderr)
+    print(f"  max-audio-bytes: {max_audio_bytes}", file=sys.stderr)
+
+
+def get_max_audio_bytes() -> int:
+    try:
+        max_audio_bytes = int(
+            os.getenv("OPENAI_TTS_MAX_AUDIO_BYTES", str(DEFAULT_MAX_AUDIO_BYTES))
+        )
+    except ValueError as e:
+        raise ValueError(
+            "Invalid OPENAI_TTS_MAX_AUDIO_BYTES; must be an integer number of bytes."
+        ) from e
+    if max_audio_bytes <= 0:
+        raise ValueError("OPENAI_TTS_MAX_AUDIO_BYTES must be > 0.")
+    return max_audio_bytes
+
+
+def list_voices() -> None:
+    for voice in OPENAI_TTS_VOICES:
+        print(voice)
 
 
 def infer_output_path(input_path: Path, explicit: str | None, fmt: str) -> Path:
@@ -371,47 +477,72 @@ def start_progress(
 def main() -> int:
     args = parse_args()
 
+    if args.list_voices:
+        list_voices()
+        return 0
+
     if not args.api_key:
         print("Missing API key. Set OPENAI_API_KEY or pass --api-key.", file=sys.stderr)
         return 2
 
-    input_path = Path(args.input_file).expanduser().resolve()
+    try:
+        base_url = validate_base_url(args.base_url, allow_internal=args.allow_internal_base_url)
+    except ValueError as e:
+        print(f"Invalid base-url: {e}", file=sys.stderr)
+        return 2
+    try:
+        input_text = resolve_input_text(args.input_file, args.text, args.stdin)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    input_source = (
+        "stdin"
+        if args.stdin
+        else "inline text"
+        if args.text is not None
+        else str(Path(args.input_file).expanduser().resolve())
+    )
+    input_path = Path(args.input_file).expanduser().resolve() if args.input_file else None
     output_path = (
         infer_output_path(input_path, args.output, args.format).expanduser().resolve()
+        if input_path is not None
+        else Path(args.output).expanduser().resolve()
+        if args.output
+        else Path(f"output.{args.format}").expanduser().resolve()
     )
     try:
         ensure_safe_output_path(output_path, force=args.force)
     except (FileExistsError, IsADirectoryError, ValueError) as e:
         print(str(e), file=sys.stderr)
         return 2
-    text = read_text(input_path)
-    estimated_seconds = estimate_duration_seconds(text, args.format)
+    estimated_seconds = estimate_duration_seconds(input_text, args.format)
     try:
-        base_url = validate_base_url(args.base_url, allow_internal=args.allow_internal_base_url)
+        max_audio_bytes = get_max_audio_bytes()
     except ValueError as e:
-        print(f"Invalid base-url: {e}", file=sys.stderr)
+        print(str(e), file=sys.stderr)
         return 2
+
+    if args.show_settings:
+        print_resolved_settings(
+            input_source=input_source,
+            output_path=output_path,
+            base_url=base_url,
+            model=args.model,
+            voice=args.voice,
+            audio_format=args.format,
+            force=args.force,
+            debug=args.debug,
+            allow_internal_base_url=args.allow_internal_base_url,
+            max_audio_bytes=max_audio_bytes,
+        )
     request = build_request(
-        base_url, args.api_key, args.model, args.voice, args.format, text
+        base_url, args.api_key, args.model, args.voice, args.format, input_text
     )
     ssl_context = build_ssl_context()
     stop_event, progress_thread = start_progress(
         "Converting text to speech", estimated_seconds, sys.stderr.isatty()
     )
 
-    try:
-        max_audio_bytes = int(
-            os.getenv("OPENAI_TTS_MAX_AUDIO_BYTES", str(DEFAULT_MAX_AUDIO_BYTES))
-        )
-    except ValueError:
-        print(
-            "Invalid OPENAI_TTS_MAX_AUDIO_BYTES; must be an integer number of bytes.",
-            file=sys.stderr,
-        )
-        return 2
-    if max_audio_bytes <= 0:
-        print("OPENAI_TTS_MAX_AUDIO_BYTES must be > 0.", file=sys.stderr)
-        return 2
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(
